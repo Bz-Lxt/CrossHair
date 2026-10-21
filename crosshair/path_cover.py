@@ -1,5 +1,6 @@
 import builtins
 import enum
+import inspect
 import re
 import traceback
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from crosshair.core import (
     LazyCreationRepr,
     deep_realize,
     explore_paths,
+    maybe_run_async,
     realize,
 )
 from crosshair.fnutil import FunctionInfo
@@ -72,7 +74,9 @@ def path_cover(
         with NoTracing():
             coverage = CoverageTracingModule(fn)
         with PushedModule(coverage):
-            return fn(*args.args, **args.kwargs)
+            # The coroutine is driven in this same thread so the coverage
+            # tracing module stays active while its body executes.
+            return maybe_run_async(fn(*args.args, **args.kwargs))
 
     def on_path_complete(
         space: StateSpace,
@@ -196,9 +200,14 @@ def output_pytest_paths(
     imports: Set[str] = set()
 
     name_with_underscores = fn_name.replace(".", "_")
+    run_fn = (
+        (lambda call: f"asyncio.run({call})")
+        if inspect.iscoroutinefunction(fn)
+        else (lambda call: call)
+    )
     for idx, path in enumerate(paths):
         test_name_suffix = "" if idx == 0 else "_" + str(idx + 1)
-        exec_fn = f"{fn_name}({path.formatted_args})"
+        exec_fn = run_fn(f"{fn_name}({path.formatted_args})")
         lines.append(f"def test_{name_with_underscores}{test_name_suffix}():")
         if path.exc is None:
             lines.append(f"    assert {exec_fn} == {path.result}")
@@ -213,5 +222,7 @@ def output_pytest_paths(
             lines.append(f"        {exec_fn}")
         lines.append("")
         references |= path.references
+    if inspect.iscoroutinefunction(fn):
+        imports.add("import asyncio")
     imports |= import_statements_for_references(references)
     return (imports, lines)

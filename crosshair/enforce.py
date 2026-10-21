@@ -1,9 +1,10 @@
 import contextlib
 import copy
 import functools
+import inspect
 import os
 from types import FrameType
-from typing import Callable, Dict, Mapping, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Set, Tuple
 
 from crosshair.condition_parser import (
     ConditionParser,
@@ -70,70 +71,95 @@ def EnforcementWrapper(
 ) -> Callable:
     signature = conditions.sig
 
+    def bind_and_check_preconditions(a, kw) -> Tuple[Any, Dict[str, Any]]:
+        with enforced.currently_enforcing(fn):
+            # debug("Calling enforcement wrapper ", fn.__name__, signature)
+            bound_args = signature.bind(*a, **kw)
+            bound_args.apply_defaults()
+            old = {}
+            mutable_args = conditions.mutable_args
+            mutable_args_remaining = (
+                set(mutable_args) if mutable_args is not None else set()
+            )
+            for argname, argval in bound_args.arguments.items():
+                try:
+                    # TODO: reduce the type realizations when argval is a SymbolicObject
+                    old[argname] = copy.copy(argval)
+                except TypeError as exc:  # for uncopyables
+                    pass
+                if argname in mutable_args_remaining:
+                    mutable_args_remaining.remove(argname)
+            if mutable_args_remaining:
+                raise PostconditionFailed(
+                    'Unrecognized mutable argument(s) in postcondition: "{}"'.format(
+                        ",".join(mutable_args_remaining)
+                    )
+                )
+            for precondition in conditions.pre:
+                # debug(' precondition eval ', precondition.expr_source)
+                # TODO: is fn_globals required here?
+                with ResumedTracing():
+                    if not precondition.evaluate(bound_args.arguments):
+                        raise PreconditionFailed(
+                            f'Precondition "{precondition.expr_source}" was not satisfied '
+                            f'before calling "{fn.__name__}"'
+                        )
+        return bound_args, old
+
+    def check_postconditions(ret, bound_args, old: Dict[str, Any]) -> None:
+        with enforced.currently_enforcing(fn):
+            if fn.__name__ in ("__init__", "__new__"):
+                old["self"] = bound_args.args[0]
+            lcls = {
+                **bound_args.arguments,
+                "__return__": ret,
+                "_": ret,
+                "__old__": AttributeHolder(old),
+            }
+            args = {**fn_globals(fn), **lcls}
+            for postcondition in conditions.post:
+                # debug('Checking postcondition ', postcondition.expr_source, ' on ', fn)
+                if not postcondition.evaluate:
+                    continue
+                with ResumedTracing():
+                    postcondition_ok = postcondition.evaluate(args)
+                if not prefer_true(postcondition_ok):
+                    raise PostconditionFailed(
+                        "Postcondition failed at {}:{}".format(
+                            postcondition.filename, postcondition.line
+                        )
+                    )
+
+    if inspect.iscoroutinefunction(fn):
+
+        async def _crosshair_async_wrapper(*a, **kw):
+            with NoTracing():
+                fns_enforcing = enforced.fns_enforcing
+                if fns_enforcing is None or fn in fns_enforcing:
+                    with ResumedTracing():
+                        return await fn(*a, **kw)
+                bound_args, old = bind_and_check_preconditions(a, kw)
+            with ResumedTracing():
+                ret = await fn(*a, **kw)
+            check_postconditions(ret, bound_args, old)
+            # debug("Completed enforcement wrapper ", fn)
+            return ret
+
+        functools.update_wrapper(_crosshair_async_wrapper, fn)
+        return _crosshair_async_wrapper
+
     def _crosshair_wrapper(*a, **kw):
         with NoTracing():
             fns_enforcing = enforced.fns_enforcing
             if fns_enforcing is None or fn in fns_enforcing:
                 with ResumedTracing():
                     return fn(*a, **kw)
-            with enforced.currently_enforcing(fn):
-                # debug("Calling enforcement wrapper ", fn.__name__, signature)
-                bound_args = signature.bind(*a, **kw)
-                bound_args.apply_defaults()
-                old = {}
-                mutable_args = conditions.mutable_args
-                mutable_args_remaining = (
-                    set(mutable_args) if mutable_args is not None else set()
-                )
-                for argname, argval in bound_args.arguments.items():
-                    try:
-                        # TODO: reduce the type realizations when argval is a SymbolicObject
-                        old[argname] = copy.copy(argval)
-                    except TypeError as exc:  # for uncopyables
-                        pass
-                    if argname in mutable_args_remaining:
-                        mutable_args_remaining.remove(argname)
-                if mutable_args_remaining:
-                    raise PostconditionFailed(
-                        'Unrecognized mutable argument(s) in postcondition: "{}"'.format(
-                            ",".join(mutable_args_remaining)
-                        )
-                    )
-                for precondition in conditions.pre:
-                    # debug(' precondition eval ', precondition.expr_source)
-                    # TODO: is fn_globals required here?
-                    with ResumedTracing():
-                        if not precondition.evaluate(bound_args.arguments):
-                            raise PreconditionFailed(
-                                f'Precondition "{precondition.expr_source}" was not satisfied '
-                                f'before calling "{fn.__name__}"'
-                            )
-            with ResumedTracing():
-                ret = fn(*a, **kw)
-            with enforced.currently_enforcing(fn):
-                if fn.__name__ in ("__init__", "__new__"):
-                    old["self"] = a[0]
-                lcls = {
-                    **bound_args.arguments,
-                    "__return__": ret,
-                    "_": ret,
-                    "__old__": AttributeHolder(old),
-                }
-                args = {**fn_globals(fn), **lcls}
-                for postcondition in conditions.post:
-                    # debug('Checking postcondition ', postcondition.expr_source, ' on ', fn)
-                    if not postcondition.evaluate:
-                        continue
-                    with ResumedTracing():
-                        postcondition_ok = postcondition.evaluate(args)
-                    if not prefer_true(postcondition_ok):
-                        raise PostconditionFailed(
-                            "Postcondition failed at {}:{}".format(
-                                postcondition.filename, postcondition.line
-                            )
-                        )
-            # debug("Completed enforcement wrapper ", fn)
-            return ret
+            bound_args, old = bind_and_check_preconditions(a, kw)
+        with ResumedTracing():
+            ret = fn(*a, **kw)
+        check_postconditions(ret, bound_args, old)
+        # debug("Completed enforcement wrapper ", fn)
+        return ret
 
     functools.update_wrapper(_crosshair_wrapper, fn)
     return _crosshair_wrapper

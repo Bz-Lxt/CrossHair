@@ -1,3 +1,4 @@
+import asyncio
 import functools
 import re
 import textwrap
@@ -44,6 +45,16 @@ def _symbolic_exception_example(x: str) -> str:
 def _has_no_successful_paths(x: int) -> None:
     with NoTracing():
         context_statespace().defer_assumption("fail", lambda: False)
+
+
+async def _async_branching_example(x: int) -> int:
+    await asyncio.sleep(0)
+    if x > 0:
+        return x * 2
+    elif x == 0:
+        raise KeyError("zero")
+    else:
+        return -x
 
 
 @dataclass
@@ -105,6 +116,29 @@ def test_path_cover_symbolic_exception_message() -> None:
             with pytest.raises(ValueError, match='foo\\'bar"baz'):
                 _symbolic_exception_example('foo\\'bar"baz')""")
     assert expected in "\n".join(lines)
+
+
+def test_path_cover_async_example() -> None:
+    paths = list(
+        path_cover(
+            FunctionInfo.from_fn(_async_branching_example),
+            OPTS,
+            CoverageType.OPCODE,
+        )
+    )
+    assert len(paths) == 3
+    outcomes = {(p.args.arguments["x"], p.result, p.exc) for p in paths}
+    assert (-1, "1", None) in outcomes
+    assert (1, "2", None) in outcomes
+    assert (0, "None", KeyError) in outcomes
+    exc_paths = [p for p in paths if p.exc is not None]
+    assert len(exc_paths) == 1
+    assert exc_paths[0].exc_message == "'zero'"
+    imports, lines = output_pytest_paths(_async_branching_example, paths)
+    text = "\n".join(lines)
+    assert "import asyncio" in imports
+    assert "asyncio.run(_async_branching_example(" in text
+    assert "pytest.raises(KeyError" in text
 
 
 def test_has_no_successful_paths() -> None:

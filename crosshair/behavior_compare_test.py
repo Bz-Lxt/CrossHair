@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from crosshair.behavior_compare import (
@@ -51,6 +53,40 @@ def test_summarize_execution_realizes_post_args_on_exception():
             result = summarize_execution(raiser, (symbolic_int,))
     assert type(result.exc) is ValueError
     assert type(result.post_args[0]) is int
+
+
+def test_summarize_execution_awaits_coroutine():
+    async def add_one(x):
+        await asyncio.sleep(0)
+        return x + 1
+
+    with standalone_statespace:
+        with ResumedTracing():
+            result = summarize_execution(add_one, (5,))
+    assert result.ret == 6
+    assert result.exc is None
+
+
+def test_summarize_execution_records_async_exception():
+    async def raiser(x):
+        await asyncio.sleep(0)
+        raise ValueError("nope")
+
+    with standalone_statespace:
+        with ResumedTracing():
+            result = summarize_execution(raiser, (1,))
+    assert type(result.exc) is ValueError
+
+
+def test_compare_returns_awaits_coroutine():
+    async def add_one(x):
+        await asyncio.sleep(0)
+        return x + 1
+
+    with standalone_statespace:
+        with ResumedTracing():
+            result = compare_returns(add_one, 5)
+    assert bool(result)
 
 
 def test_compare_returns_handles_closed_stream_post_args():

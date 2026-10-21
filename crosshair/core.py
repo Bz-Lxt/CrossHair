@@ -8,6 +8,7 @@
 # TODO: mutating symbolic Callables?
 # TODO: contracts on the contracts of function and object inputs/outputs?
 
+import asyncio
 import enum
 import functools
 import inspect
@@ -28,6 +29,7 @@ from typing import (
     Any,
     Callable,
     Collection,
+    Coroutine,
     Dict,
     FrozenSet,
     Iterable,
@@ -102,6 +104,7 @@ from crosshair.util import (
     ATOMIC_IMMUTABLE_TYPES,
     UNABLE_TO_REPR_TEXT,
     AttributeHolder,
+    ControlFlowException,
     CrossHairInternal,
     CrosshairUnsupported,
     CrossHairValue,
@@ -259,7 +262,10 @@ class ExceptionFilter:
                 # See https://github.com/pschanely/CrossHair/issues/8
                 debug("Proxy intolerace:", exc_value, "at", format_exc())
                 raise CrosshairUnsupported("Detected proxy intolerance")
-            if isinstance(exc_value, (Exception, PreconditionFailed)):
+            if isinstance(
+                exc_value,
+                (Exception, PreconditionFailed, asyncio.CancelledError),
+            ):
                 if isinstance(
                     exc_value,
                     (
@@ -1200,6 +1206,17 @@ class ShortCircuitingContext:
             return original
         sig = subconditions.sig
 
+        if inspect.iscoroutinefunction(original):
+            # Async functions are never short-circuited.
+            @functools.wraps(original)
+            async def _crosshair_async_wrapper(
+                *a: object, **kw: Dict[str, object]
+            ) -> object:
+                return await original(*a, **kw)
+
+            self.interceptor_cache[original] = _crosshair_async_wrapper
+            return _crosshair_async_wrapper
+
         def _crosshair_wrapper(*a: object, **kw: Dict[str, object]) -> object:
             space = optional_context_statespace()
             if (not self.engaged) or (not space):
@@ -1537,6 +1554,127 @@ def explore_loop(
     return ExplorationResult(top_analysis, exhausted, i)
 
 
+# These exceptions abandon the symbolic path even when raised by a task that
+# the main coroutine never awaits.
+_ASYNC_PATH_ABORT_EXCS = (
+    ControlFlowException,
+    PreconditionFailed,
+    PostconditionFailed,
+)
+
+
+def _cancel_remaining_tasks(
+    loop: asyncio.AbstractEventLoop,
+    tracked_tasks: Set[asyncio.Task],
+    aborted: List[BaseException],
+) -> None:
+    # Tasks' `finally` blocks run symbolic code and may schedule more tasks, so
+    # cancel and drain until no pending tasks remain.
+    all_tasks = getattr(asyncio, "all_tasks", None)
+    for _ in range(16):
+        pending = {task for task in tracked_tasks if not task.done()}
+        if all_tasks is not None:
+            pending.update(task for task in all_tasks(loop) if not task.done())
+        if not pending:
+            break
+        for task in pending:
+            task.cancel()
+        results = loop.run_until_complete(
+            asyncio.gather(*pending, return_exceptions=True)
+        )
+        for result in results:
+            if isinstance(result, _ASYNC_PATH_ABORT_EXCS):
+                aborted.append(result)
+    # Consume exceptions from finished tasks so they don't surface later at
+    # garbage collection.
+    for task in tuple(tracked_tasks):
+        if task.done() and not task.cancelled():
+            exc = task.exception()
+            if isinstance(exc, _ASYNC_PATH_ABORT_EXCS):
+                aborted.append(exc)
+
+
+def run_async(coro: Coroutine[Any, Any, _T]) -> _T:
+    """
+    Drive a coroutine to completion on a private, freshly created event loop.
+
+    A new loop is used per call and is fully torn down afterwards: leftover
+    tasks are cancelled and drained, async generators and the default thread
+    executor are shut down, and the loop is closed. Exceptions in
+    ``_ASYNC_PATH_ABORT_EXCS`` from any task take precedence over the main
+    coroutine's exception.
+    """
+    loop = asyncio.new_event_loop()
+    tracked_tasks: Set[asyncio.Task] = set()
+    aborted: List[BaseException] = []
+
+    def track_task_factory(
+        factory_loop: asyncio.AbstractEventLoop, coroutine: Any, **kwargs: Any
+    ) -> asyncio.Task:
+        # Temporarily unset this factory so task creation doesn't recurse
+        # into it.
+        factory_loop.set_task_factory(None)
+        try:
+            task = factory_loop.create_task(coroutine, **kwargs)
+        finally:
+            factory_loop.set_task_factory(track_task_factory)
+        tracked_tasks.add(task)
+        return task
+
+    def exception_handler(
+        handler_loop: asyncio.AbstractEventLoop, context: Dict[str, Any]
+    ) -> None:
+        exc = context.get("exception")
+        if isinstance(exc, _ASYNC_PATH_ABORT_EXCS):
+            aborted.append(exc)
+        else:
+            handler_loop.default_exception_handler(context)
+
+    main_task: Optional[asyncio.Task] = None
+    main_exc: Optional[BaseException] = None
+    try:
+        asyncio.set_event_loop(loop)
+        loop.set_task_factory(track_task_factory)
+        loop.set_exception_handler(exception_handler)
+        main_task = loop.create_task(coro)
+        tracked_tasks.add(main_task)
+        try:
+            loop.run_until_complete(main_task)
+        except BaseException as exc:
+            main_exc = exc
+        _cancel_remaining_tasks(loop, tracked_tasks, aborted)
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        # A second pass: async generator finalization can schedule tasks.
+        _cancel_remaining_tasks(loop, tracked_tasks, aborted)
+        shutdown_default_executor = getattr(loop, "shutdown_default_executor", None)
+        if shutdown_default_executor is not None:
+            loop.run_until_complete(shutdown_default_executor())
+    finally:
+        try:
+            asyncio.set_event_loop(None)
+        finally:
+            loop.close()
+
+    if aborted:
+        raise aborted[0] from main_exc
+    if main_exc is not None:
+        raise main_exc
+    assert main_task is not None
+    return main_task.result()
+
+
+def maybe_run_async(result: Any) -> Any:
+    """
+    Run ``result`` to completion on an isolated event loop when it is a
+    coroutine; otherwise return it unchanged.
+    """
+    with NoTracing():
+        is_coroutine = inspect.iscoroutine(result)
+    if is_coroutine:
+        return run_async(result)
+    return result
+
+
 def explore_paths(
     fn: Callable[[BoundArguments], Any],
     sig: Signature,
@@ -1561,7 +1699,7 @@ def explore_paths(
         user_exc_stack: Optional[StackSummary] = None
         try:
             with ExceptionFilter() as efilter, ResumedTracing():
-                ret = fn(args)
+                ret = maybe_run_async(fn(args))
             if efilter.user_exc:
                 if isinstance(efilter.user_exc[0], NotDeterministic):
                     raise NotDeterministic
@@ -1660,7 +1798,19 @@ def attempt_call(
         bargs, bkwargs = bound_args.args, bound_args.kwargs
         debug("Starting function body")
         with enforced_conditions.enabled_enforcement(), short_circuit, ResumedTracing():
-            __return__ = unenforced_fn(*bargs, **bkwargs)
+            __call_result__ = unenforced_fn(*bargs, **bkwargs)
+            with NoTracing():
+                __call_is_coroutine__ = inspect.iscoroutine(__call_result__)
+            if __call_is_coroutine__:
+                # The loop's scheduling machinery (timers, selectors) runs
+                # symbolic; never defer its calls.
+                short_circuit.engaged = False
+                try:
+                    __return__ = run_async(__call_result__)
+                finally:
+                    short_circuit.engaged = True
+            else:
+                __return__ = __call_result__
         lcls = {
             **bound_args.arguments,
             "__return__": __return__,

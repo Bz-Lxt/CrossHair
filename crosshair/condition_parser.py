@@ -109,7 +109,7 @@ def get_doc_lines(thing: object) -> Iterable[Tuple[int, str]]:
         debug(f"Unable to parse {thing} into an AST; will not detect PEP316 contracts.")
         return
     fndef = module.body[0]
-    if not isinstance(fndef, (ast.ClassDef, ast.FunctionDef)):
+    if not isinstance(fndef, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
         return
     firstnode = fndef.body[0]
     if not isinstance(firstnode, ast.Expr):
@@ -1058,7 +1058,7 @@ class AssertsParser(ConcreteConditionParser):
             return None
         ast_module = ast.parse(textwrap.dedent("".join(lines)))
         ast_fn = ast_module.body[0]
-        if not isinstance(ast_fn, ast.FunctionDef):
+        if not isinstance(ast_fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             return None
         found_any_preconditions = False
         for statement in ast_fn.body:
@@ -1095,18 +1095,33 @@ class AssertsParser(ConcreteConditionParser):
 
         filename, first_line, _lines = sourcelines(fn)
 
-        @wraps(fn)
-        def wrappedfn(*a, **kw):
-            try:
-                return NoEnforce(fn)(*a, **kw)
-            except AssertionError as e:
-                # TODO: check that this isn't failing at an early line in a different
-                # file?
-                _, lineno = frame_summary_for_fn(
-                    fn, traceback.extract_tb(e.__traceback__)
-                )
-                if lineno >= first_body_line:
-                    raise
+        if inspect.iscoroutinefunction(fn):
+
+            @wraps(fn)
+            async def wrappedfn(*a, **kw):
+                try:
+                    return await NoEnforce(fn)(*a, **kw)
+                except AssertionError as e:
+                    _, lineno = frame_summary_for_fn(
+                        fn, traceback.extract_tb(e.__traceback__)
+                    )
+                    if lineno >= first_body_line:
+                        raise
+
+        else:
+
+            @wraps(fn)
+            def wrappedfn(*a, **kw):
+                try:
+                    return NoEnforce(fn)(*a, **kw)
+                except AssertionError as e:
+                    # TODO: check that this isn't failing at an early line in a different
+                    # file?
+                    _, lineno = frame_summary_for_fn(
+                        fn, traceback.extract_tb(e.__traceback__)
+                    )
+                    if lineno >= first_body_line:
+                        raise
 
         post = [
             ConditionExpr(

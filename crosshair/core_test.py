@@ -1,4 +1,5 @@
 import abc
+import asyncio
 import dataclasses
 import importlib
 import inspect
@@ -1409,6 +1410,228 @@ def test_max_iterations_zero_does_not_crash():
     msgs = run_checkables(analyze_function(f, opts))
     states = {m.state for m in msgs}
     assert EXEC_ERR not in states
+
+
+async def async_await_chain(x: int) -> int:
+    """
+    post: _ == x + 1
+    """
+    await asyncio.sleep(0)
+    return x + 1
+
+
+async def async_sometimes_false_post(x: int) -> int:
+    """
+    post: _ > x
+    """
+    await asyncio.sleep(0)
+    return x if x > 5 else x - 1
+
+
+async def async_raises_for_negative(x: int) -> int:
+    """
+    post: True
+    """
+    await asyncio.sleep(0)
+    if x < 0:
+        raise ValueError("negative")
+    return x
+
+
+async def async_gather_doubles(items: List[int]) -> int:
+    """
+    pre: len(items) <= 4
+    post: _ == sum(items)
+    """
+
+    async def double(v):
+        await asyncio.sleep(0)
+        return v * 2
+
+    doubled = await asyncio.gather(*(double(v) for v in items))
+    return sum(doubled) // 2
+
+
+async def async_tasks_doubles(items: List[int]) -> int:
+    """
+    pre: len(items) <= 4
+    post: _ == 2 * sum(items)
+    """
+
+    async def double(v):
+        await asyncio.sleep(0)
+        return v * 2
+
+    tasks = [asyncio.create_task(double(v)) for v in items]
+    return sum(await asyncio.gather(*tasks))
+
+
+async def async_appends_marked(items: List[int]) -> int:
+    """
+    pre: len(items) <= 4
+    post[items]: True
+    """
+    await asyncio.sleep(0)
+    items.append(1)
+    return len(items)
+
+
+async def async_wait_for_timeout(x: int) -> int:
+    """
+    pre: x >= 0
+    raises: asyncio.TimeoutError
+    """
+
+    async def slow():
+        await asyncio.sleep(10)
+        return x
+
+    return await asyncio.wait_for(slow(), timeout=0.01)
+
+
+async def async_generator_doubles(items: List[int]) -> int:
+    """
+    pre: len(items) <= 3
+    post: _ == 2 * sum(items)
+    """
+
+    async def gen():
+        for v in items:
+            await asyncio.sleep(0)
+            yield v * 2
+
+    total = 0
+    async for v in gen():
+        total += v
+    return total
+
+
+_async_cleanup_marker = []
+
+
+async def async_runs_finally(x: int) -> int:
+    """
+    post: _ == x + 1
+    """
+    try:
+        await asyncio.sleep(0)
+        return x + 1
+    finally:
+        _async_cleanup_marker.append("cleaned")
+
+
+async def async_spawns_unawaited_task(x: int) -> int:
+    """
+    post: _ == x
+    """
+
+    async def background():
+        await asyncio.sleep(0)
+        if x > 100000:
+            raise RuntimeError("boom in background")
+
+    asyncio.create_task(background())
+    await asyncio.sleep(0)
+    return x
+
+
+async def _async_contracted_callee(x: int) -> int:
+    """
+    pre: x >= 0
+    post: _ == x + 1
+    """
+    await asyncio.sleep(0)
+    return x + 1
+
+
+async def async_calls_contracted_callee_twice(x: int) -> int:
+    """
+    pre: x >= 0
+    post: _ == x + 2
+    """
+    first = await _async_contracted_callee(x)
+    return await _async_contracted_callee(first)
+
+
+async def async_violates_callee_precondition(x: int) -> int:
+    """
+    post: True
+    """
+    return await _async_contracted_callee(x)
+
+
+async def async_remove_smallest_with_asserts(numbers: List[int]) -> None:
+    assert len(numbers) > 0
+    await asyncio.sleep(0)
+    smallest = min(numbers)
+    numbers.remove(smallest)
+    assert len(numbers) == 0 or min(numbers) > smallest
+
+
+def test_async_await_chain_confirmed():
+    check_states(async_await_chain, CONFIRMED)
+
+
+def test_async_post_fail():
+    check_states(async_sometimes_false_post, POST_FAIL)
+
+
+def test_async_exception_exec_err():
+    actual, expected = check_exec_err(async_raises_for_negative, "ValueError: negative")
+    assert actual == expected
+
+
+def test_async_gather_confirmed():
+    check_states(async_gather_doubles, CONFIRMED)
+
+
+def test_async_create_tasks_confirmed():
+    check_states(async_tasks_doubles, CONFIRMED)
+
+
+def test_async_marked_mutation_confirmed():
+    check_states(async_appends_marked, CONFIRMED)
+
+
+def test_async_declared_cancellation_confirmed():
+    check_states(async_wait_for_timeout, CONFIRMED)
+
+
+def test_async_generator_confirmed():
+    check_states(async_generator_doubles, CONFIRMED)
+
+
+def test_async_finally_runs_on_cleanup():
+    _async_cleanup_marker.clear()
+    check_states(async_runs_finally, CONFIRMED)
+    assert _async_cleanup_marker == ["cleaned"]
+
+
+def test_async_unawaited_background_task_is_cleaned_up():
+    check_states(async_spawns_unawaited_task, CONFIRMED)
+
+
+def test_async_contracted_callee_enforced():
+    check_states(async_calls_contracted_callee_twice, CONFIRMED)
+    actual, expected = check_exec_err(
+        async_violates_callee_precondition, "PreconditionFailed"
+    )
+    assert actual == expected
+
+
+def test_async_asserts():
+    fn = async_remove_smallest_with_asserts
+    messages = analyze_function(
+        fn,
+        DEFAULT_OPTIONS.overlay(
+            analysis_kind=[AnalysisKind.asserts],
+        ),
+    )
+    line = fn.__code__.co_firstlineno + 5
+    expected, actual = check_messages(
+        messages, state=MessageType.EXEC_ERR, line=line, column=0
+    )
+    assert expected == actual
 
 
 def profile():

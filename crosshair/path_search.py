@@ -5,7 +5,12 @@ from inspect import BoundArguments
 from typing import Callable, Optional, Type
 
 from crosshair.copyext import CopyMode, deepcopyext
-from crosshair.core import ExceptionFilter, LazyCreationRepr, explore_paths
+from crosshair.core import (
+    ExceptionFilter,
+    LazyCreationRepr,
+    explore_paths,
+    maybe_run_async,
+)
 from crosshair.fnutil import FunctionInfo
 from crosshair.libimpl.builtinslib import SymbolicInt
 from crosshair.options import AnalysisOptions
@@ -85,7 +90,9 @@ def path_search(
 
     best_input: Optional[str] = None
     best_score: Optional[int] = None
-    _optimize_fn = optimize_fn or (lambda _ret, args: fn(*args.args, **args.kwargs))
+    _optimize_fn = optimize_fn or (
+        lambda _ret, args: maybe_run_async(fn(*args.args, **args.kwargs))
+    )
 
     def on_path_complete(
         space: StateSpace,
@@ -114,7 +121,7 @@ def path_search(
                 return True
         with NoTracing(), ExceptionFilter() as efilter:
             with ResumedTracing():
-                score = _optimize_fn(ret, pre_args)
+                score = maybe_run_async(_optimize_fn(ret, pre_args))
                 space.detach_path()
             smt_score = SymbolicInt._coerce_to_smt_sort(score)
             if smt_score is None:

@@ -1,4 +1,5 @@
 import abc
+import asyncio
 import sys
 from contextlib import ExitStack
 
@@ -21,6 +22,28 @@ def foo(x: int) -> int:
     post: _ > x
     """
     return x * 2
+
+
+async def asyncfoo(x: int) -> int:
+    """
+    pre: 0 <= x <= 100
+    post: _ > x
+    """
+    await asyncio.sleep(0)
+    return x + 1
+
+
+async def asyncbadpost(x: int) -> int:
+    """
+    pre: x >= 0
+    post: _ > x
+    """
+    await asyncio.sleep(0)
+    return x - 1
+
+
+async def asyncfoocaller(x: int) -> int:
+    return await asyncfoo(x)
 
 
 class Pokeable:
@@ -82,6 +105,22 @@ class TestCore:
         with Enforcement():
             with pytest.raises(AttributeError):
                 same_thing(not_copyable)
+
+
+class TestAsyncCore:
+    def test_enforce_async_conditions(self) -> None:
+        with Enforcement():
+            assert asyncio.run(asyncfoo(50)) == 51
+            with pytest.raises(PreconditionFailed):
+                asyncio.run(asyncfoo(-1))
+            with pytest.raises(PostconditionFailed):
+                asyncio.run(asyncbadpost(0))
+
+    def test_enforce_nested_async_call(self) -> None:
+        with Enforcement():
+            assert asyncio.run(asyncfoocaller(50)) == 51
+            with pytest.raises(PreconditionFailed):
+                asyncio.run(asyncfoocaller(-1))
 
 
 class BaseFooable:

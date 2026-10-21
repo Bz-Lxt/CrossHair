@@ -1,3 +1,4 @@
+import asyncio
 from typing import Callable, List, Optional
 
 from crosshair.diff_behavior import (
@@ -36,6 +37,23 @@ def _foo3(x: int) -> int:
 
 
 foo3 = FunctionInfo.from_fn(_foo3)
+
+
+async def _async_foo1(x: int) -> int:
+    await asyncio.sleep(0)
+    if x >= 100:
+        return 100
+    return x
+
+
+async def _async_foo3(x: int) -> int:
+    await asyncio.sleep(0)
+    if x > 1000:
+        return 1000
+    elif x > 100:
+        return 100
+    else:
+        return x
 
 
 class Base:
@@ -105,6 +123,19 @@ class TestBehaviorDiff:
 
     def test_diff_behavior_different(self) -> None:
         diffs = diff_behavior(foo1, foo3, DEFAULT_OPTIONS.overlay(max_iterations=10))
+        assert len(diffs) == 1
+        diff = diffs[0]
+        assert isinstance(diff, BehaviorDiff)
+        assert int(diff.args["x"]) > 1000
+        assert diff.result1.return_repr == "100"
+        assert diff.result2.return_repr == "1000"
+
+    def test_diff_behavior_async(self) -> None:
+        diffs = diff_behavior(
+            FunctionInfo.from_fn(_async_foo1),
+            FunctionInfo.from_fn(_async_foo3),
+            DEFAULT_OPTIONS.overlay(max_iterations=10),
+        )
         assert len(diffs) == 1
         diff = diffs[0]
         assert isinstance(diff, BehaviorDiff)

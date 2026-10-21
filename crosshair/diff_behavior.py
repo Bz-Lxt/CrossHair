@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Un
 
 from crosshair import IgnoreAttempt
 from crosshair.behavior_compare import flexible_equal
-from crosshair.core import ExceptionFilter, deep_realize, explore_paths
+from crosshair.core import ExceptionFilter, deep_realize, explore_paths, maybe_run_async
 from crosshair.fnutil import FunctionInfo
 from crosshair.options import AnalysisOptions
 from crosshair.statespace import RootNode, StateSpace
@@ -67,7 +67,7 @@ def describe_behavior(
     fn: Callable, args: inspect.BoundArguments
 ) -> Tuple[Any, Optional[BaseException]]:
     with ExceptionFilter() as efilter:
-        ret = fn(*args.args, **args.kwargs)
+        ret = maybe_run_async(fn(*args.args, **args.kwargs))
         return (ret, None)
     if efilter.user_exc is not None:
         exc = efilter.user_exc[0]

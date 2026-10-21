@@ -11,7 +11,7 @@ differential shared by ``fuzz_core_test`` and the support measurement
 Nothing here reaches for ``crosshair.inputgen``, which needs hypothesis (a dev-only
 extra): a caller builds the ``CallSpec`` and supplies its inputs.
 """
-
+import asyncio
 from collections.abc import Set as AbcSet
 from copy import deepcopy
 from dataclasses import dataclass
@@ -37,6 +37,7 @@ from typing import (
 from crosshair.core import (
     Patched,
     deep_realize,
+    maybe_run_async,
     pin_to,
     proxy_for_type,
     suspected_proxy_intolerance_exception,
@@ -239,10 +240,10 @@ def summarize_execution(
     if not kwargs:
         kwargs = {}
     ret: object = None
-    exc: Optional[Exception] = None
+    exc: Optional[BaseException] = None
     tbstr: Optional[str] = None
     try:
-        possibly_symbolic_ret = fn(*args, **kwargs)
+        possibly_symbolic_ret = maybe_run_async(fn(*args, **kwargs))
         if detach_path:
             context_statespace().detach_path()
             detach_path = False
@@ -253,7 +254,7 @@ def summarize_execution(
             ret = IterableResult(tuple(_ret), ret_type)  # type: ignore
         else:
             ret = _ret
-    except Exception as e:
+    except (Exception, asyncio.CancelledError) as e:
         exc = e
         if detach_path:
             context_statespace().detach_path(e)

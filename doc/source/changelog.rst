@@ -6,6 +6,11 @@ Changelog
 Next Version
 ---------------
 
+ * Contract-checked ``async def`` functions are now executed by
+   ``crosshair check``, ``crosshair cover``, ``crosshair diffbehavior``, and
+   ``crosshair search``. Each path is run to completion in a fresh, isolated
+   event loop, including awaited calls, concurrent tasks, cancellation, and
+   async cleanup; cover output wraps generated calls in ``asyncio.run``.
  * ``struct`` formats with a native byte order (``@``, ``=``, or no prefix) now
    encode and decode integers using the host's byte order, instead of
    big-endian.
